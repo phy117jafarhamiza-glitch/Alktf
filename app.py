@@ -4,38 +4,27 @@ import mediapipe as mp
 import numpy as np
 import tempfile
 
-# إعدادات واجهة التطبيق
-st.set_page_config(page_title="Snatch Pro Evaluator", layout="wide")
-
-# رسالة تنبيهية تظهر في البداية
-st.warning("⚠️ ملاحظة هامة: للحصول على تقييم دقيق، يجب أن يكون التصوير من الجانب (Side View) وبشكل أفقي تماماً.")
-st.title("🏋️ نظام تقييم رفعة الخطف والتحليل الفني")
+st.set_page_config(page_title="Snatch Phase Analyzer", layout="wide")
+st.title("🏋️ محلل مراحل رفعة الخطف (الاستعداد ثم السحب)")
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
-def calculate_angle(a, b, c):
-    a, b, c = np.array(a), np.array(b), np.array(c)
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
-    angle = np.abs(radians*180.0/np.pi)
-    if angle > 180.0: angle = 360 - angle
-    return angle
-
-video_file = st.file_uploader("قم برفع فيديو الرفعة الجانبي هنا", type=["mp4", "mov", "avi"])
+video_file = st.file_uploader("ارفع فيديو الرفعة الجانبي", type=["mp4", "mov", "avi"])
 
 if video_file:
     tfile = tempfile.NamedTemporaryFile(delete=False) 
     tfile.write(video_file.read())
     cap = cv2.VideoCapture(tfile.name)
-    
     st_frame = st.empty()
     
-    # متغيرات التقييم والملاحظات
-    scores = {"setup": 5, "first_pull": 3, "catch": 5, "stability": 2}
+    error_flags = {"hip_high": False, "hip_low": False, "early_back": False, "bar_away": False}
     feedbacks = []
-    max_path_deviation = 0
-    path_points = []
-
+    
+    # متغيرات لتحديد لحظة بدء الحركة
+    movement_started = False
+    initial_wrist_y = None
+    
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
@@ -44,67 +33,68 @@ if video_file:
         results = pose.process(frame_rgb)
 
         if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
-            h, w, _ = frame.shape
-            
-            # تحديد النقاط الرئيسية
-            shoulder = [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-            hip = [landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-            knee = [landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
-            wrist = [landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y]
-            ankle = [landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
+            lm = results.pose_landmarks.landmark
+            sh_y, hip_y, knee_y = lm[12].y, lm[24].y, lm[26].y
+            wrist_x, wrist_y = lm[16].x, lm[16].y
+            ankle_x = lm[28].x
 
-            # --- تحليل الأخطاء وتحديد مكانها ---
-            
-            # 1. خطأ وقفة الاستعداد
-            back_angle = calculate_angle(shoulder, hip, knee)
-            if back_angle < 35 or back_angle > 75:
-                if "وضع الحوض خاطئ في البداية" not in feedbacks:
-                    feedbacks.append("وضع الحوض خاطئ في البداية (منخفض جداً أو مرتفع جداً)")
-                    scores["setup"] -= 2
+            # --- الخطوة 1: اكتشاف لحظة بدء الحركة ---
+            if initial_wrist_y is None:
+                initial_wrist_y = wrist_y # تخزين موقع البار في أول إطار
 
-            # 2. خطأ السحبة الأولى (تقوس الظهر)
-            if back_angle > 85 and wrist[1] > knee[1]:
-                if "رفع الظهر مبكراً" not in feedbacks:
-                    feedbacks.append("خطأ في السحبة الأولى: قمت برفع الظهر قبل عبور البار للركبة")
-                    scores["first_pull"] -= 1
+            # إذا تحرك المعصم للأعلى بمسافة ملحوظة، نعلن بدء السحبة الأولى
+            if not movement_started and abs(wrist_y - initial_wrist_y) > 0.02:
+                movement_started = True
 
-            # 3. خطأ مسار البار (الابتعاد عن الجسم)
-            if len(path_points) > 0:
-                deviation = abs(wrist[0] - ankle[0])
-                if deviation > 0.15: # إذا ابتعد البار عن خط الكاحل بمسافة كبيرة
-                    cv2.putText(frame, "BAR DISTANCE ERROR!", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-                    if "البار بعيد عن الجسم" not in feedbacks:
-                        feedbacks.append("المسار الفني: البار يبتعد عن جسمك بشكل كبير (Looping)")
-                        scores["catch"] -= 1
+            # --- الخطوة 2: تحليل وقفة الاستعداد (قبل الحركة فقط) ---
+            if not movement_started:
+                if not (error_flags["hip_high"] or error_flags["hip_low"]):
+                    if hip_y < sh_y + 0.05:
+                        error_flags["hip_high"] = True
+                        feedbacks.append("❌ الاستعداد: الحوض مرتفع جداً قبل بدء السحب.")
+                    elif hip_y > knee_y - 0.05:
+                        error_flags["hip_low"] = True
+                        feedbacks.append("❌ الاستعداد: الحوض منخفض جداً (وضعية قرفصاء وليست استعداد).")
+                
+                cv2.putText(frame, "PHASE: SETUP", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
-            # رسم المسار والنقاط
-            cx, cy = int(wrist[0] * w), int(wrist[1] * h)
-            path_points.append((cx, cy))
-            for i in range(1, len(path_points)):
-                cv2.line(frame, path_points[i-1], path_points[i], (0, 255, 0), 2)
+            # --- الخطوة 3: تحليل السحبة الأولى (بعد بدء الحركة) ---
+            else:
+                cv2.putText(frame, "PHASE: FIRST PULL", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                if not error_flags["early_back"]:
+                    # قياس إذا كان الحوض يرتفع أسرع من الكتف في بداية السحب
+                    if hip_y > sh_y + 0.2: 
+                        error_flags["early_back"] = True
+                        feedbacks.append("❌ السحبة الأولى: تقوس الظهر (ارتفاع الحوض أسرع من الصدر).")
+
+            # تحليل المسار (مستمر طوال الحركة)
+            if movement_started and not error_flags["bar_away"]:
+                if abs(wrist_x - ankle_x) > 0.18:
+                    error_flags["bar_away"] = True
+                    feedbacks.append("❌ المسار: البار يبتعد عن مسار القدمين.")
 
         st_frame.image(frame, channels="BGR", use_column_width=True)
-
     cap.release()
 
-    # --- عرض لوحة النتائج النهائية ---
+    # --- النتائج النهائية والدرجات ---
+    score_setup = 5 if not (error_flags["hip_high"] or error_flags["hip_low"]) else 2
+    score_pull = 3 if not error_flags["early_back"] else 1
+    score_catch = 5 if not error_flags["bar_away"] else 3
+    total_score = score_setup + score_pull + score_catch + 2
+
     st.divider()
-    total_score = sum(scores.values())
-    st.header(f"النتيجة النهائية: {total_score} / 15")
+    st.header(f"النتيجة: {total_score} / 15")
     
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📊 تفاصيل الدرجات")
-        st.write(f"✅ الاستعداد: {scores['setup']}/5")
-        st.write(f"✅ السحبة الأولى: {scores['first_pull']}/3")
-        st.write(f"✅ السقوط: {scores['catch']}/5")
-        st.write(f"✅ الثبات: {scores['stability']}/2")
+        st.subheader("📊 تقييم المراحل")
+        st.write(f"1️⃣ وقفة الاستعداد: {score_setup}/5")
+        st.write(f"2️⃣ السحبة الأولى: {score_pull}/3")
+        st.write(f"3️⃣ السقوط والثبات: {score_catch + 2}/7")
         
     with col2:
-        st.subheader("❌ الأخطاء المكتشفة")
+        st.subheader("💡 تحليل الأخطاء والنصائح")
         if feedbacks:
-            for error in feedbacks:
-                st.error(error)
-        else:
-            st.success("أداء ممتاز! لم يتم رصد أخطاء فنية كبرى.")
+            for error in feedbacks: st.error(error)
+        else: st.success("ممتاز! حافظت على الفصل الصحيح بين مراحل الرفعة.")
